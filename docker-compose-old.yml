@@ -1,0 +1,103 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_MAX_MESSAGE_BYTES: 20000000
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: 20000000
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+
+  # ─── Postgres for Airflow Metadata ───────────────────────────────
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+
+  # # ─── Apache Airflow ───────────────────────────────────────────────
+  # airflow:
+  #   image: apache/airflow:2.8.1
+  #   restart: unless-stopped
+  #   environment:
+  #     AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  #     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+  #     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  #     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+  #     AIRFLOW__CORE__FERNET_KEY: "$(openssl rand -hex 16)"
+  #   volumes:
+  #     - ./airflow/dags:/opt/airflow/dags
+  #     - ./airflow/logs:/opt/airflow/logs
+  #     - ./airflow/plugins:/opt/airflow/plugins
+  #   ports:
+  #     - "8080:8080"
+  #   depends_on:
+  #     - postgres
+
+
+  scraper:
+    build:
+      context: ./scraper
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+    restart: unless-stopped
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=host.docker.internal:9092
+      - STATE_DIR=/data/state
+    volumes:
+      - ./data/state:/data/state
+
+  consumer:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+    restart: unless-stopped
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=jobs
+      - OUTPUT_DIR=/data/raw
+    volumes:
+      - ./data/raw:/data/raw
+
+  spark:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+    restart: on-failure
+    volumes:
+      - ./spark:/app
+      - ./data/bronze:/data/bronze
+    command: >
+      spark-submit
+        --master local[*]
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0
+        /app/spark_ingest.py
